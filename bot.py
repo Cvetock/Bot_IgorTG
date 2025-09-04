@@ -74,13 +74,14 @@ async def book_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
           for m in masters]
     kb.append([InlineKeyboardButton("↩ Назад", callback_data="TO_MAIN")])
     await update.message.reply_text("Выберите мастера:", reply_markup=InlineKeyboardMarkup(kb))
+    return SELECT_MASTER
+
 
 async def sel_master_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     _, master_id = query.data.split("|")
     context.user_data["master_id"] = int(master_id)
 
-    # Соберём занятые даты этого мастера
     session = SessionLocal()
     appts = session.query(Appointment).filter_by(master_id=master_id).all()
     busy = {a.date for a in appts}
@@ -89,34 +90,20 @@ async def sel_master_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     cal = build_calendar(today.year, today.month, busy)
     await query.edit_message_text("Выберите дату:", reply_markup=cal)
+    return SELECT_DATE
+
 
 async def calendar_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Листание месяцев и выбор дня."""
     query = update.callback_query
     data = query.data
 
-    if data.startswith("CAL"):
-        _, y, m = data.split("|")
-        y, m = int(y), int(m)
-        session = SessionLocal()
-        master_id = context.user_data["master_id"]
-        appts = session.query(Appointment).filter_by(master_id=master_id).all()
-        busy = {a.date for a in appts}
-        session.close()
-
-        cal = build_calendar(y, m, busy)
-        await query.edit_message_reply_markup(cal)
-
-    elif data.startswith("DAY"):
+    if data.startswith("DAY"):
         _, iso = data.split("|")
         chosen = date.fromisoformat(iso)
         context.user_data["date"] = chosen
         await query.edit_message_text("Введите ваше имя:")
-        return
+        return ENTER_NAME
 
-    elif data == "BACK_TO_MASTERS":
-        await query.edit_message_text("Выберите мастера:", reply_markup=None)
-        await book_start(update, context)
 
 async def back_to_masters(update, context):
     query = update.callback_query
@@ -129,10 +116,11 @@ async def back_to_masters(update, context):
 async def enter_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["client_name"] = update.message.text
     await update.message.reply_text("Введите телефон:")
+    return ENTER_PHONE
+
 async def enter_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["client_phone"] = update.message.text
 
-    # Сохраняем запись
     session = SessionLocal()
     appt = Appointment(
         master_id   = context.user_data["master_id"],
@@ -144,15 +132,16 @@ async def enter_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session.add(appt)
     session.commit()
 
-    # Уведомляем клиента и мастера
     await update.message.reply_text("Ваша запись сохранена!", reply_markup=MAIN_MENU)
     master = session.query(Master).get(context.user_data["master_id"])
     await context.bot.send_message(
         master.tg_id,
-        f"Новая запись:\n{appt.client_name}, {appt.client_phone}\n"
-        f"Дата: {appt.date}"
+        f"Новая запись:\n{appt.client_name}, {appt.client_phone}\nДата: {appt.date}"
     )
     session.close()
+    context.user_data.clear()
+    return ConversationHandler.END
+
 
 # --- /mybooking и /cancelbooking ---
 async def my_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,6 +201,41 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 # --- Админ-меню мастера ---
+ADMINS = {834598783}
+async def add_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMINS:
+        await update.message.reply_text("❌ У вас нет прав для добавления мастеров.")
+        return
+
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("Использование: /addmaster <tg_id> <имя>")
+        return
+
+    tg_id, name = args
+    tg_id = int(tg_id)
+
+    session = SessionLocal()
+
+    # Добавляем пользователя, если его нет
+    existing_user = session.query(User).get(tg_id)
+    if not existing_user:
+        session.add(User(tg_id=tg_id, role="master"))
+
+    # Добавляем мастера
+    master = Master(tg_id=tg_id, name=name)
+    session.add(master)
+
+    try:
+        session.commit()
+        await update.message.reply_text(f"✅ Мастер {name} добавлен.")
+    except Exception as e:
+        session.rollback()
+        await update.message.reply_text(f"❌ Ошибка при добавлении мастера: {e}")
+    finally:
+        session.close()
+
 async def admin_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
     master = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
@@ -236,15 +260,22 @@ def main():
     app.add_handler(CommandHandler("contacts", contacts))
 
     # Рабочие хендлеры
-    app.add_handler(MessageHandler(filters.Regex("📝 Запись"), book_start))
-    app.add_handler(CallbackQueryHandler(sel_master_cb, pattern="SEL_MASTER"))
-    app.add_handler(CallbackQueryHandler(calendar_cb, pattern="^(CAL|DAY|BACK_TO_MASTERS)"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name), 1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone), 2)
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("📝 Запись"), book_start)],
+        states={
+            SELECT_MASTER: [CallbackQueryHandler(sel_master_cb, pattern="SEL_MASTER")],
+            SELECT_DATE: [CallbackQueryHandler(calendar_cb, pattern="^(CAL|DAY|BACK_TO_MASTERS)")],
+            ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
+            ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone)],
+        },
+        fallbacks=[],
+    )
+    app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(cancel_cb, pattern="DO_CANCEL"))
     app.add_handler(MessageHandler(filters.Regex("📋 Моя запись"), my_booking))
     app.add_handler(MessageHandler(filters.Regex("❌ Отменить запись"), cancel_booking))
     app.add_handler(MessageHandler(filters.Regex("☎ Контакты"), contacts))
+    app.add_handler(CommandHandler("addmaster", add_master))
 
     # Админ-мастер
     app.add_handler(MessageHandler(filters.Regex("📄 Все записи"), admin_all))
