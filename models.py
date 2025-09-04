@@ -1,41 +1,48 @@
 from sqlalchemy import (
-    Column, Integer, String, Date, DateTime, ForeignKey
+    Column,
+    Integer,
+    String,
+    Date,
+    DateTime,
+    Time,
+    ForeignKey
 )
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
-from sqlalchemy import Time
 
 Base = declarative_base()
 
 class User(Base):
     __tablename__ = "users"
     tg_id = Column(Integer, primary_key=True)
-    role = Column(String, default="client")  # client или master
+    role  = Column(String, default="client")  # client или master
 
 class Master(Base):
     __tablename__ = "masters"
-    id = Column(Integer, primary_key=True)
+    id   = Column(Integer, primary_key=True)
     tg_id = Column(Integer, ForeignKey("users.tg_id"), unique=True)
     name = Column(String, nullable=False)
     user = relationship("User", backref="master")
+    availabilities = relationship("Availability", back_populates="master")
 
 class Appointment(Base):
     __tablename__ = "appointments"
-    id = Column(Integer, primary_key=True)
-    master_id = Column(Integer, ForeignKey("masters.id"))
-    user_id = Column(Integer, ForeignKey("users.tg_id"))
-    client_name = Column(String)
+    id           = Column(Integer, primary_key=True)
+    master_id    = Column(Integer, ForeignKey("masters.id"))
+    user_id      = Column(Integer, ForeignKey("users.tg_id"))
+    client_name  = Column(String)
     client_phone = Column(String)
-    date = Column(Date)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    date         = Column(Date)
+    time         = Column(Time, nullable=False)
+    created_at   = Column(DateTime, default=datetime.utcnow)
 
     master = relationship("Master", backref="appointments")
-    user = relationship("User", backref="appointments")
+    user   = relationship("User", backref="appointments")
 
 class Availability(Base):
     __tablename__ = "availabilities"
     id        = Column(Integer, primary_key=True)
     master_id = Column(Integer, ForeignKey("masters.id"), nullable=False)
     date      = Column(Date, nullable=False)
-    time      = Column(Time, nullable=False)  # или String, если удобнее
-    master    = relationship("Master", backref="availabilities")
+    time      = Column(Time, nullable=False)
+    master    = relationship("Master", back_populates="availabilities")

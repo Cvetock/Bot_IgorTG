@@ -1,8 +1,8 @@
 from datetime import date, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import CallbackQueryHandler
+
 def build_calendar(year: int, month: int, busy: set[date]) -> InlineKeyboardMarkup:
-    # Шапка
+    # Навигационная шапка
     prev_month = month - 1 or 12
     prev_year  = year - 1 if month == 1 else year
     next_month = month + 1 if month < 12 else 1
@@ -18,11 +18,12 @@ def build_calendar(year: int, month: int, busy: set[date]) -> InlineKeyboardMark
     week_days = ["Mo","Tu","We","Th","Fr","Sa","Su"]
     rows = [[InlineKeyboardButton(w, callback_data="IGNORE") for w in week_days]]
 
-    # Заполнение дат
+    # Заполнение чисел
     first = date(year, month, 1)
-    start_weekday = first.weekday()
+    start_weekday = first.weekday()  # 0=Mon … 6=Sun
     row = [InlineKeyboardButton(" ", callback_data="IGNORE")] * start_weekday
     d = first
+
     while d.month == month:
         txt = str(d.day)
         if d in busy:
@@ -37,10 +38,12 @@ def build_calendar(year: int, month: int, busy: set[date]) -> InlineKeyboardMark
             row = []
         d += timedelta(days=1)
 
+    # Заполнение последней строки
     if row:
         row += [InlineKeyboardButton(" ", callback_data="IGNORE")] * (7 - len(row))
         rows.append(row)
 
     # Кнопка «Назад»
     rows.append([InlineKeyboardButton("↩ Назад", callback_data="BACK_TO_MASTERS")])
+
     return InlineKeyboardMarkup([header] + rows)
