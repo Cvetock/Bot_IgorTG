@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from datetime import date
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from telegram.ext import ConversationHandler
 from telegram import (
     Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 )
@@ -14,6 +15,7 @@ from models import Base, User, Master, Appointment
 from calendar_utils import build_calendar
 from telegram.ext import CallbackQueryHandler
 
+SELECT_MASTER, SELECT_DATE, ENTER_NAME, ENTER_PHONE = range(4)
 # Загрузка конфигов
 load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
@@ -248,12 +250,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("📄 Все записи"), admin_all))
     app.add_handler(CallbackQueryHandler(back_to_masters, pattern="^BACK_TO_MASTERS$"))
     # Настройка Webhook
-    app.bot.set_webhook(url=f"{WEBHOOK_HOST}{WEBHOOK_PATH}")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=WEBHOOK_PORT,
-        webhook_path=WEBHOOK_PATH
-    )
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
