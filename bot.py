@@ -15,7 +15,8 @@ from models import Base, User, Master, Appointment
 from calendar_utils import build_calendar
 from telegram.ext import CallbackQueryHandler
 
-SELECT_MASTER, SELECT_DATE, ENTER_NAME, ENTER_PHONE = range(4)
+SELECT_MASTER, SELECT_DATE, SELECT_TIME, ENTER_NAME, ENTER_PHONE = range(5)
+
 # Загрузка конфигов
 load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
@@ -98,11 +99,43 @@ async def calendar_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("DAY"):
-        _, iso = data.split("|")
-        chosen = date.fromisoformat(iso)
-        context.user_data["date"] = chosen
-        await query.edit_message_text("Введите ваше имя:")
-        return ENTER_NAME
+    _, iso = data.split("|")
+    chosen = date.fromisoformat(iso)
+    context.user_data["date"] = chosen
+
+    # 1) Получаем все доступные слоты мастера на эту дату
+    session = SessionLocal()
+    master_id = context.user_data["master_id"]
+    # слоты, которые мастер добавил
+    avails = session.query(Availability) \
+        .filter_by(master_id=master_id, date=chosen) \
+        .all()
+    # уже занятые (аппойнтменты)
+    appts = session.query(Appointment) \
+        .filter_by(master_id=master_id, date=chosen) \
+        .all()
+    session.close()
+
+    taken = {a.time for a in appts}
+    free_slots = [av.time.strftime("%H:%M") for av in avails if av.time not in taken]
+
+    # 2) Строим клавиатуру с кнопками времени
+    kb = [[InlineKeyboardButton(ts, callback_data=f"TIME|{ts}")]
+          for ts in free_slots]
+    kb.append([InlineKeyboardButton("↩ Назад", callback_data="BACK_TO_MASTERS")])
+    await query.edit_message_text(
+        "Выберите время:", reply_markup=InlineKeyboardMarkup(kb)
+    )
+    return SELECT_TIME
+
+async def select_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    _, timestr = query.data.split("|")
+    context.user_data["time"] = timestr
+    await query.edit_message_text("Введите ваше имя:")
+    return ENTER_NAME
 
 
 async def back_to_masters(update, context):
@@ -265,10 +298,12 @@ def main():
         states={
             SELECT_MASTER: [CallbackQueryHandler(sel_master_cb, pattern="SEL_MASTER")],
             SELECT_DATE: [CallbackQueryHandler(calendar_cb, pattern="^(CAL|DAY|BACK_TO_MASTERS)")],
+            SELECT_TIME: [CallbackQueryHandler(select_time_cb, pattern="^TIME\\|")],
             ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
             ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone)],
         },
         fallbacks=[],
+        per_message=True
     )
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(cancel_cb, pattern="DO_CANCEL"))

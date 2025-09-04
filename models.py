@@ -3,6 +3,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
+from sqlalchemy import Time
 
 Base = declarative_base()
 
@@ -30,3 +31,11 @@ class Appointment(Base):
 
     master = relationship("Master", backref="appointments")
     user = relationship("User", backref="appointments")
+
+class Availability(Base):
+    __tablename__ = "availabilities"
+    id        = Column(Integer, primary_key=True)
+    master_id = Column(Integer, ForeignKey("masters.id"), nullable=False)
+    date      = Column(Date, nullable=False)
+    time      = Column(Time, nullable=False)  # или String, если удобнее
+    master    = relationship("Master", backref="availabilities")
