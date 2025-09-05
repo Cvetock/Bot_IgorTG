@@ -9,12 +9,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship
 from datetime import datetime
+from sqlalchemy import BigInteger
 
 Base = declarative_base()
 
 class User(Base):
     __tablename__ = "users"
-    tg_id = Column(Integer, primary_key=True)
+    tg_id = Column(BigInteger, primary_key=True)
     role  = Column(String, default="client")  # client или master
 
 class Master(Base):

@@ -285,7 +285,8 @@ async def admin_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ——— МАСТЕР: УДАЛЕНИЕ ЗАПИСИ (FSM как в бронировании) ——————————————————
 # --- Календарь для удаления ---
-def build_delete_calendar(year: int, month: int, busy_dates: set[date]) -> InlineKeyboardMarkup:
+# --- Календарь для удаления (все даты кликабельны) ---
+def build_delete_calendar(year: int, month: int) -> InlineKeyboardMarkup:
     prev_month = month - 1 or 12
     prev_year  = year - 1 if month == 1 else year
     next_month = month + 1 if month < 12 else 1
@@ -305,10 +306,7 @@ def build_delete_calendar(year: int, month: int, busy_dates: set[date]) -> Inlin
 
     d = first
     while d.month == month:
-        if d in busy_dates:
-            row.append(InlineKeyboardButton(str(d.day), callback_data=f"DEL_DAY|{d.isoformat()}"))
-        else:
-            row.append(InlineKeyboardButton(str(d.day), callback_data="IGNORE"))
+        row.append(InlineKeyboardButton(str(d.day), callback_data=f"DEL_DAY|{d.isoformat()}"))
         if len(row) == 7:
             rows.append(row)
             row = []
@@ -327,16 +325,97 @@ async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
     master = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
     context.user_data["master_id"] = master.id
-    busy = {a.date for a in session.query(Appointment).filter_by(master_id=master.id).all()}
     session.close()
 
-    if not busy:
-        return await update.message.reply_text("Нет записей для удаления.", reply_markup=ADMIN_MENU)
-
     today = date.today()
-    cal = build_delete_calendar(today.year, today.month, busy)
+    cal = build_delete_calendar(today.year, today.month)
     await update.message.reply_text("Выберите дату для удаления:", reply_markup=cal)
     return DEL_DATE
+
+
+# --- Обработка кликов по календарю удаления ---
+async def delete_date_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Листание месяцев
+    if data.startswith("DEL_CAL|"):
+        _, y, m = data.split("|")
+        y, m = int(y), int(m)
+        cal = build_delete_calendar(y, m)
+        await query.edit_message_reply_markup(reply_markup=cal)
+        return DEL_DATE
+
+    # Назад
+    if data == "DEL_BACK":
+        await query.message.reply_text("Возвращаемся в меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # Выбор даты
+    if data.startswith("DEL_DAY|"):
+        _, iso = data.split("|")
+        chosen = date.fromisoformat(iso)
+
+        session = SessionLocal()
+        appts = session.query(Appointment).filter_by(
+            master_id=context.user_data["master_id"], date=chosen
+        ).order_by(Appointment.time).all()
+        session.close()
+
+        appts = [a for a in appts if a.time is not None]
+        if not appts:
+            await query.edit_message_text(f"Нет записей на {chosen}.", reply_markup=None)
+            return ConversationHandler.END
+
+        kb = [[InlineKeyboardButton(a.time.strftime("%H:%M"), callback_data=f"DEL_APPT|{a.id}")]
+              for a in appts]
+        kb.append([InlineKeyboardButton("↩ Назад", callback_data="DEL_BACK")])
+        await query.edit_message_text("Выберите время для удаления:", reply_markup=InlineKeyboardMarkup(kb))
+        return DEL_TIME
+
+
+# --- Удаление конкретной записи ---
+async def delete_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "DEL_BACK":
+        await query.message.reply_text("Возвращаемся в меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if data.startswith("DEL_APPT|"):
+        _, appt_id = data.split("|")
+        session = SessionLocal()
+        appt = session.get(Appointment, int(appt_id))
+        if not appt:
+            session.close()
+            await query.edit_message_text("Запись не найдена.", reply_markup=None)
+            return ConversationHandler.END
+
+        # Уведомляем клиента
+        if appt.user_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=appt.user_id,
+                    text=f"Ваша запись {appt.date} в {appt.time.strftime('%H:%M')} отменена мастером."
+                )
+            except Exception:
+                pass
+
+        session.delete(appt)
+        session.commit()
+        session.close()
+
+        await query.edit_message_text("Запись удалена.", reply_markup=None)
+        context.user_data.clear()
+        return ConversationHandler.END
+
 
 
 # --- Обработка кликов по календарю удаления ---
@@ -426,6 +505,152 @@ async def delete_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
+
+# --- Календарь удаления слотов (все даты кликабельны) ---
+def build_slot_delete_calendar(year: int, month: int) -> InlineKeyboardMarkup:
+    prev_month = month - 1 or 12
+    prev_year  = year - 1 if month == 1 else year
+    next_month = month + 1 if month < 12 else 1
+    next_year  = year + 1 if month == 12 else year
+
+    header = [
+        InlineKeyboardButton("◀", callback_data=f"SDEL_CAL|{prev_year}|{prev_month}"),
+        InlineKeyboardButton(f"{month}/{year}", callback_data="IGNORE"),
+        InlineKeyboardButton("▶", callback_data=f"SDEL_CAL|{next_year}|{next_month}")
+    ]
+    week_days = ["Mo","Tu","We","Th","Fr","Sa","Su"]
+    rows = [[InlineKeyboardButton(w, callback_data="IGNORE") for w in week_days]]
+
+    first = date(year, month, 1)
+    shift = first.weekday()
+    row = [InlineKeyboardButton(" ", callback_data="IGNORE")] * shift
+
+    d = first
+    while d.month == month:
+        rows_last_len = len(row)
+        row.append(InlineKeyboardButton(str(d.day), callback_data=f"SDEL_DAY|{d.isoformat()}"))
+        if len(row) == 7:
+            rows.append(row)
+            row = []
+        d += timedelta(days=1)
+
+    if row:
+        row += [InlineKeyboardButton(" ", callback_data="IGNORE")] * (7 - len(row))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("↩ Назад", callback_data="SDEL_BACK")])
+    return InlineKeyboardMarkup([header] + rows)
+
+
+# Состояния для удаления слотов (можно переиспользовать DEL_DATE/DEL_TIME, но лучше отдельные)
+SDEL_DATE, SDEL_TIME = range(9, 11)
+
+
+async def delete_slot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Старт удаления свободных слотов
+    session = SessionLocal()
+    master = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
+    session.close()
+
+    if not master:
+        return await update.message.reply_text("Вы не мастер.", reply_markup=MAIN_MENU)
+
+    context.user_data["master_id"] = master.id
+
+    today = date.today()
+    cal = build_slot_delete_calendar(today.year, today.month)
+    await update.message.reply_text("Выберите дату для удаления слота:", reply_markup=cal)
+    return SDEL_DATE
+
+
+async def delete_slot_date_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # Листание месяцев
+    if data.startswith("SDEL_CAL|"):
+        _, y, m = data.split("|")
+        cal = build_slot_delete_calendar(int(y), int(m))
+        await query.edit_message_reply_markup(reply_markup=cal)
+        return SDEL_DATE
+
+    # Назад
+    if data == "SDEL_BACK":
+        await query.message.reply_text("Возвращаемся в меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # Выбор даты
+    if data.startswith("SDEL_DAY|"):
+        _, iso = data.split("|")
+        chosen = date.fromisoformat(iso)
+
+        session = SessionLocal()
+        # Берём только свободные слоты: в Availability, которых нет в Appointment на эту дату
+        avails = session.query(Availability).filter_by(
+            master_id=context.user_data["master_id"], date=chosen
+        ).all()
+        taken_times = {
+            a.time for a in session.query(Appointment).filter_by(
+                master_id=context.user_data["master_id"], date=chosen
+            ).all() if a.time is not None
+        }
+        free_avails = [av for av in avails if av.time not in taken_times]
+        session.close()
+
+        if not free_avails:
+            await query.edit_message_text(f"Нет свободных слотов на {chosen}.", reply_markup=None)
+            return ConversationHandler.END
+
+        kb = [[InlineKeyboardButton(av.time.strftime("%H:%M"), callback_data=f"SDEL_AVAIL|{av.id}")]
+              for av in sorted(free_avails, key=lambda x: x.time)]
+        kb.append([InlineKeyboardButton("↩ Назад", callback_data="SDEL_BACK")])
+
+        await query.edit_message_text("Выберите слот для удаления:", reply_markup=InlineKeyboardMarkup(kb))
+        return SDEL_TIME
+
+
+async def delete_slot_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "SDEL_BACK":
+        await query.message.reply_text("Возвращаемся в меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if data.startswith("SDEL_AVAIL|"):
+        _, avail_id = data.split("|")
+        session = SessionLocal()
+        av = session.get(Availability, int(avail_id))
+
+        if not av:
+            session.close()
+            await query.edit_message_text("Слот не найден.", reply_markup=None)
+            return ConversationHandler.END
+
+        # На всякий случай, не удаляем, если слот уже занят
+        is_taken = session.query(Appointment).filter_by(
+            master_id=av.master_id, date=av.date, time=av.time
+        ).first()
+
+        if is_taken:
+            session.close()
+            await query.edit_message_text("Слот уже занят, удаление запрещено.", reply_markup=None)
+            return ConversationHandler.END
+
+        session.delete(av)
+        session.commit()
+        session.close()
+
+        await query.edit_message_text("Слот удалён.", reply_markup=None)
+        context.user_data.clear()
+        return ConversationHandler.END
+
 # ——— МАСТЕР: ДОБАВЛЕНИЕ СЛОТОВ (FSM) ————————————————————————————
 async def master_avail_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
@@ -467,6 +692,48 @@ async def master_enter_times(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"Слоты добавлены для {context.user_data['avail_date']}.", reply_markup=cal)
     return MASTER_DATE
 
+async def force_book_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сбросим все данные и состояние
+    context.user_data.clear()
+    await book_start(update, context)
+    return SELECT_MASTER
+
+async def force_master_avail_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сбрасываем всё и показываем календарь
+    context.user_data.clear()
+    today = date.today()
+    cal = build_calendar(today.year, today.month, busy=set())
+    # Отправляем новое сообщение (а не edit), чтобы быть независимыми от прошлого состояния
+    await update.message.reply_text("Выберите дату для добавления слотов:", reply_markup=cal)
+    return MASTER_DATE
+
+async def master_date_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("CAL|"):
+        _, y, m = data.split("|")
+        cal = build_calendar(int(y), int(m), busy=set())
+        await query.edit_message_reply_markup(reply_markup=cal)
+        return MASTER_DATE
+
+    if data in ("BACK", "BACK_TO_MASTERS", "AV_BACK"):
+        await query.message.reply_text("Меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if data.startswith("DAY|"):
+        _, iso = data.split("|")
+        chosen = date.fromisoformat(iso)
+        context.user_data["avail_date"] = chosen
+        await query.edit_message_text(
+            f"Введите слоты для {chosen} (например, 13.00,14.30):"
+        )
+        return MASTER_ENTER_TIMES
+
+
 # ——— РЕГИСТРАЦИЯ ——————————————————————————————————
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -506,7 +773,8 @@ def main():
         per_user=True
     )
     app.add_handler(delete_conv)
-
+    # Глобальный хендлер
+    app.add_handler(MessageHandler(filters.Regex("^📝 Запись$"), force_book_start))
     # FSM бронирования
     booking_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📝 Запись$"), book_start)],
@@ -533,19 +801,39 @@ def main():
     )
     app.add_handler(booking_conv)
 
+    delete_slot_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🗑 Удалить слот$"), delete_slot_start)],
+        states={
+            SDEL_DATE: [
+                CallbackQueryHandler(delete_slot_date_cb, pattern=r"^SDEL_CAL\|"),
+                CallbackQueryHandler(delete_slot_date_cb, pattern=r"^SDEL_DAY\|"),
+                CallbackQueryHandler(delete_slot_date_cb, pattern=r"^SDEL_BACK$"),
+                CallbackQueryHandler(ignore_cb, pattern=r"^IGNORE$")
+            ],
+            SDEL_TIME: [
+                CallbackQueryHandler(delete_slot_time_cb, pattern=r"^SDEL_AVAIL\|"),
+                CallbackQueryHandler(delete_slot_time_cb, pattern=r"^SDEL_BACK$")
+            ],
+        },
+        fallbacks=[MessageHandler(filters.Regex("^↩ Назад$"), start)],
+        per_user=True
+    )
+    app.add_handler(delete_slot_conv)
+
     # FSM добавления слотов мастером (тот же календарь)
     avail_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🗓 Указать дату и время$"), master_avail_start)],
+        entry_points=[MessageHandler(filters.Regex("^🗓 Указать дату и время$"), force_master_avail_start)],
         states={
             MASTER_DATE: [
                 CallbackQueryHandler(master_date_chosen, pattern=r"^CAL\|"),
                 CallbackQueryHandler(master_date_chosen, pattern=r"^DAY\|"),
-                CallbackQueryHandler(master_date_chosen, pattern=r"^BACK$"),
-                CallbackQueryHandler(ignore_cb,          pattern=r"^IGNORE$")
+                # Поддерживаем несколько вариантов back из твоего календаря
+                CallbackQueryHandler(master_date_chosen, pattern=r"^(BACK|BACK_TO_MASTERS|AV_BACK)$"),
+                CallbackQueryHandler(ignore_cb, pattern=r"^IGNORE$")
             ],
             MASTER_ENTER_TIMES: [
                 MessageHandler(filters.Regex(r"^\d{1,2}[.:]\d{2}(,\s*\d{1,2}[.:]\d{2})*$"), master_enter_times)
-            ]
+            ],
         },
         fallbacks=[MessageHandler(filters.Regex("^↩ Назад$"), start)],
         per_user=True
