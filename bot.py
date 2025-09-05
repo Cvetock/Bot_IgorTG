@@ -1,5 +1,7 @@
 import os
-from datetime import date, datetime, time
+import logging
+from datetime import date, datetime, time, timedelta
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -21,11 +23,13 @@ from telegram.ext import (
 )
 
 from models import Base, User, Master, Appointment, Availability
-from calendar_utils import build_calendar
+from calendar_utils import build_calendar  # календарь бронирования: CAL|, DAY|, BACK/IGNORE
 
-# —————————————————————————————————————————
-#  Конфигурация и инициализация базы
-# —————————————————————————————————————————
+# ——— ЛОГИРОВАНИЕ ——————————————————————————————————
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                    level=logging.INFO)
+
+# ——— БАЗА ——————————————————————————————————
 load_dotenv()
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -34,132 +38,145 @@ engine       = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base.metadata.create_all(engine)
 
-# —————————————————————————————————————————
-#  Главное меню и меню мастера
-# —————————————————————————————————————————
+# ——— МЕНЮ ——————————————————————————————————
 MAIN_MENU = ReplyKeyboardMarkup(
     [["📝 Запись", "📋 Моя запись"],
      ["❌ Отменить запись", "☎ Контакты"]],
     resize_keyboard=True
 )
-
 ADMIN_MENU = ReplyKeyboardMarkup(
     [["📅 Мои слоты", "🗓 Указать дату и время"],
-     ["📄 Все записи", "↩ Назад"]],
+     ["📄 Все записи", "🗑 Удалить запись"],
+     ["↩ Назад"]],
     resize_keyboard=True
 )
 
-# —————————————————————————————————————————
-#  FSM-состояния
-# —————————————————————————————————————————
+# ——— FSM ——————————————————————————————————
 SELECT_MASTER, SELECT_DATE, SELECT_TIME, ENTER_NAME, ENTER_PHONE = range(5)
 MASTER_DATE, MASTER_ENTER_TIMES = range(5, 7)
+DEL_DATE, DEL_TIME = range(7, 9)
 
-# Telegram ID(ш) админа(ов), кто может /addmaster
-ADMINS = {123456789}
+ADMINS = {123456789}  # ваш Telegram ID
 
-# —————————————————————————————————————————
-#  Команды /start, /id, /addmaster
-# —————————————————————————————————————————
+# ——— УТИЛИТА: календарь удаления на базе build_calendar ————————————————
+def build_delete_calendar(year: int, month: int, busy_dates: set[date]) -> InlineKeyboardMarkup:
+    # Используем тот же протокол, что в бронировании (CAL|, DAY|).
+    # Но кликабельными делаем только busy_dates, остальные — IGNORE.
+    prev_month = month - 1 or 12
+    prev_year  = year - 1 if month == 1 else year
+    next_month = month + 1 if month < 12 else 1
+    next_year  = year + 1 if month == 12 else year
+
+    header = [
+        InlineKeyboardButton("◀", callback_data=f"CAL|{prev_year}|{prev_month}"),
+        InlineKeyboardButton(f"{month}/{year}", callback_data="IGNORE"),
+        InlineKeyboardButton("▶", callback_data=f"CAL|{next_year}|{next_month}")
+    ]
+    week_days = ["Mo","Tu","We","Th","Fr","Sa","Su"]
+    rows = [[InlineKeyboardButton(w, callback_data="IGNORE") for w in week_days]]
+
+    first = date(year, month, 1)
+    shift = first.weekday()
+    row = [InlineKeyboardButton(" ", callback_data="IGNORE")] * shift
+
+    d = first
+    while d.month == month:
+        if d in busy_dates:
+            row.append(InlineKeyboardButton(str(d.day), callback_data=f"DAY|{d.isoformat()}"))
+        else:
+            row.append(InlineKeyboardButton(str(d.day), callback_data="IGNORE"))
+        if len(row) == 7:
+            rows.append(row)
+            row = []
+        d += timedelta(days=1)
+
+    if row:
+        row += [InlineKeyboardButton(" ", callback_data="IGNORE")] * (7 - len(row))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("↩ Назад", callback_data="BACK")])
+    return InlineKeyboardMarkup([header] + rows)
+
+# ——— ОБЩИЕ ——————————————————————————————————
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
     tg_id = update.effective_user.id
-
-    # Регистрируем нового пользователя как client
     if not session.get(User, tg_id):
         session.add(User(tg_id=tg_id, role="client"))
         session.commit()
-
-    # Показываем меню мастера или клиента
     master = session.query(Master).filter_by(tg_id=tg_id).first()
     session.close()
-
     if master:
-        await update.message.reply_text(
-            f"Привет, мастер {master.name}!", reply_markup=ADMIN_MENU
-        )
+        await update.message.reply_text(f"Привет, мастер {master.name}!", reply_markup=ADMIN_MENU)
     else:
-        await update.message.reply_text(
-            "Здравствуйте! Это бот онлайн-записи.", reply_markup=MAIN_MENU
-        )
+        await update.message.reply_text("Здравствуйте! Это бот онлайн-записи.", reply_markup=MAIN_MENU)
 
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш Telegram ID: {update.effective_user.id}")
 
 async def add_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
-        return await update.message.reply_text("❌ У вас нет прав для этой команды.")
-    args = context.args
-    if len(args) != 2:
+    if update.effective_user.id not in ADMINS:
+        return await update.message.reply_text("❌ У вас нет прав.")
+    if len(context.args) != 2:
         return await update.message.reply_text("Использование: /addmaster <tg_id> <Имя>")
-
-    tg_id, name = int(args[0]), args[1]
+    tg_id, name = int(context.args[0]), context.args[1]
     session = SessionLocal()
-
-    # Добавляем и в users, и в masters
     if not session.get(User, tg_id):
         session.add(User(tg_id=tg_id, role="master"))
     session.add(Master(tg_id=tg_id, name=name))
+    session.commit()
+    session.close()
+    await update.message.reply_text(f"✅ Мастер {name} добавлен.")
 
-    try:
-        session.commit()
-        await update.message.reply_text(f"✅ Мастер {name} добавлен.")
-    except Exception as e:
-        session.rollback()
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-    finally:
-        session.close()
+async def ignore_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
 
-# —————————————————————————————————————————
-#  Просмотр своих слотов (для мастера)
-# —————————————————————————————————————————
-async def view_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ——— КЛИЕНТ: МОЯ/ОТМЕНА/КОНТАКТЫ ————————————————————————————
+async def my_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
-    master = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
+    appt = session.query(Appointment).filter_by(user_id=update.effective_user.id)\
+            .order_by(Appointment.created_at.desc()).first()
+    session.close()
+    if not appt or appt.time is None:
+        return await update.message.reply_text("Записи нет.")
+    await update.message.reply_text(f"{appt.date} в {appt.time.strftime('%H:%M')} — {appt.client_name}, {appt.client_phone}")
 
-    avails = session.query(Availability)\
-                    .filter_by(master_id=master.id)\
-                    .order_by(Availability.date, Availability.time)\
-                    .all()
-    appts = session.query(Appointment)\
-                   .filter_by(master_id=master.id)\
-                   .order_by(Appointment.date, Appointment.time)\
-                   .all()
+async def send_contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📞 +7 123 456-78-90\n🌐 your_site.com")
+
+async def cancel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = SessionLocal()
+    appt = session.query(Appointment).filter_by(user_id=update.effective_user.id)\
+            .order_by(Appointment.created_at.desc()).first()
+    session.close()
+    if not appt or appt.time is None:
+        return await update.message.reply_text("Нечего отменять.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Подтвердить отмену", callback_data="CANCEL_YES")],
+        [InlineKeyboardButton("↩ Назад", callback_data="BACK")]
+    ])
+    await update.message.reply_text(f"Текущая запись: {appt.date} в {appt.time.strftime('%H:%M')}", reply_markup=kb)
+
+async def cancel_yes_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    session = SessionLocal()
+    appt = session.query(Appointment).filter_by(user_id=query.from_user.id)\
+            .order_by(Appointment.created_at.desc()).first()
+    if appt:
+        session.delete(appt)
+        session.commit()
+        await query.edit_message_text("Запись отменена.")
     session.close()
 
-    dates = sorted({a.date for a in avails} | {b.date for b in appts})
-    if not dates:
-        return await update.message.reply_text("Нет слотов или записей.", reply_markup=ADMIN_MENU)
-
-    lines = []
-    for d in dates:
-        slots_on_d = [slot.time for slot in avails if slot.date == d]
-        taken     = {b.time for b in appts if b.date == d}
-        slots_str = ", ".join(
-            f"{t.strftime('%H:%M')} {'🔴' if t in taken else '🟢'}"
-            for t in sorted(slots_on_d)
-        )
-        lines.append(f"{d}:\n{slots_str or '-'}")
-
-    text = "\n\n".join(lines)
-    await update.message.reply_text(text, reply_markup=ADMIN_MENU)
-
-# —————————————————————————————————————————
-#  Клиентская часть: бронирование
-# —————————————————————————————————————————
+# ——— КЛИЕНТ: БРОНИРОВАНИЕ (FSM) ————————————————————————————
 async def book_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
     masters = session.query(Master).all()
     session.close()
-
-    kb = [[InlineKeyboardButton(m.name, callback_data=f"SEL_MASTER|{m.id}")]
-          for m in masters]
-    kb.append([InlineKeyboardButton("↩ Назад", callback_data="BACK_TO_MAIN")])
-
-    await update.message.reply_text(
-        "Выберите мастера:", reply_markup=InlineKeyboardMarkup(kb)
-    )
+    kb = [[InlineKeyboardButton(m.name, callback_data=f"SEL_MASTER|{m.id}")] for m in masters]
+    kb.append([InlineKeyboardButton("↩ Назад", callback_data="BACK")])
+    await update.message.reply_text("Выберите мастера:", reply_markup=InlineKeyboardMarkup(kb))
     return SELECT_MASTER
 
 async def sel_master_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -167,14 +184,8 @@ async def sel_master_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     _, mid = query.data.split("|")
     context.user_data["master_id"] = int(mid)
-
-    session = SessionLocal()
-    busy_appts = session.query(Appointment).filter_by(master_id=int(mid)).all()
-    busy_dates = {a.date for a in busy_appts}
-    session.close()
-
     today = date.today()
-    cal = build_calendar(today.year, today.month, busy_dates)
+    cal = build_calendar(today.year, today.month, busy=set())
     await query.edit_message_text("Выберите дату:", reply_markup=cal)
     return SELECT_DATE
 
@@ -182,42 +193,27 @@ async def calendar_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
-    # Листание месяцев
-    if data.startswith("CAL"):
+    if data.startswith("CAL|"):
         _, y, m = data.split("|")
-        y, m = int(y), int(m)
-        session = SessionLocal()
-        busy_appts = session.query(Appointment)\
-                            .filter_by(master_id=context.user_data["master_id"]).all()
-        busy_dates = {a.date for a in busy_appts}
-        session.close()
-
-        cal = build_calendar(y, m, busy_dates)
-        await query.edit_message_reply_markup(cal)
+        cal = build_calendar(int(y), int(m), busy=set())
+        await query.edit_message_reply_markup(reply_markup=cal)
         return SELECT_DATE
-
-    # Выбор даты
-    if data.startswith("DAY"):
+    if data == "BACK":
+        await query.message.reply_text("Главное меню.", reply_markup=MAIN_MENU)
+        await query.delete_message()
+        return ConversationHandler.END
+    if data.startswith("DAY|"):
         _, iso = data.split("|")
         chosen = date.fromisoformat(iso)
         context.user_data["date"] = chosen
-
         session = SessionLocal()
-        avails = session.query(Availability)\
-                        .filter_by(master_id=context.user_data["master_id"], date=chosen)\
-                        .all()
-        appts = session.query(Appointment)\
-                       .filter_by(master_id=context.user_data["master_id"], date=chosen)\
-                       .all()
+        avails = session.query(Availability).filter_by(master_id=context.user_data["master_id"], date=chosen).all()
+        appts = session.query(Appointment).filter_by(master_id=context.user_data["master_id"], date=chosen).all()
         session.close()
-
-        taken = {a.time for a in appts}
-        free_slots = [av.time.strftime("%H:%M") for av in avails if av.time not in taken]
-
-        kb = [[InlineKeyboardButton(ts, callback_data=f"TIME|{ts}")] for ts in free_slots]
-        kb.append([InlineKeyboardButton("↩ Назад", callback_data="BACK_TO_MAIN")])
-
+        taken = {a.time for a in appts if a.time is not None}
+        free = [av.time.strftime("%H:%M") for av in avails if av.time not in taken]
+        kb = [[InlineKeyboardButton(ts, callback_data=f"TIME|{ts}")] for ts in free]
+        kb.append([InlineKeyboardButton("↩ Назад", callback_data="BACK")])
         await query.edit_message_text("Выберите время:", reply_markup=InlineKeyboardMarkup(kb))
         return SELECT_TIME
 
@@ -226,195 +222,338 @@ async def select_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     _, ts = query.data.split("|")
     context.user_data["time"] = ts
-
     await query.edit_message_text("Введите ваше имя:")
     return ENTER_NAME
 
-async def enter_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def enter_name_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["client_name"] = update.message.text
     await update.message.reply_text("Введите телефон:")
     return ENTER_PHONE
 
-async def enter_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def enter_phone_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["client_phone"] = update.message.text
-
     session = SessionLocal()
     appt = Appointment(
-        master_id   = context.user_data["master_id"],
-        user_id     = update.effective_user.id,
-        client_name = context.user_data["client_name"],
-        client_phone= context.user_data["client_phone"],
-        date        = context.user_data["date"],
-        time        = datetime.strptime(context.user_data["time"], "%H:%M").time()
+        master_id=context.user_data["master_id"],
+        user_id=update.effective_user.id,
+        client_name=context.user_data["client_name"],
+        client_phone=context.user_data["client_phone"],
+        date=context.user_data["date"],
+        time=datetime.strptime(context.user_data["time"], "%H:%M").time(),
     )
     session.add(appt)
     session.commit()
-
-    await update.message.reply_text("Ваша запись сохранена!", reply_markup=MAIN_MENU)
-
     master = session.query(Master).get(context.user_data["master_id"])
-    await context.bot.send_message(
-        chat_id=master.tg_id,
-        text=(
-            f"Новая запись:\n"
-            f"{appt.client_name}, {appt.client_phone}\n"
-            f"{appt.date} в {appt.time.strftime('%H:%M')}"
-        )
-    )
+    try:
+        await context.bot.send_message(chat_id=master.tg_id,
+            text=f"Новая запись:\n{appt.client_name}, {appt.client_phone}\n{appt.date} в {appt.time.strftime('%H:%M')}")
+    except Exception:
+        pass
     session.close()
+    await update.message.reply_text("Ваша запись сохранена!", reply_markup=MAIN_MENU)
     context.user_data.clear()
     return ConversationHandler.END
 
-# —————————————————————————————————————————
-#  Клиент: просмотр и отмена записи
-# —————————————————————————————————————————
-async def my_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ——— МАСТЕР: МОИ СЛОТЫ / ВСЕ ЗАПИСИ ————————————————————————————
+async def view_availability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = SessionLocal()
-    appt = session.query(Appointment)\
-                  .filter_by(user_id=update.effective_user.id)\
-                  .order_by(Appointment.created_at.desc())\
-                  .first()
+    master = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
+    avails = session.query(Availability).filter_by(master_id=master.id).order_by(Availability.date, Availability.time).all()
+    appts  = session.query(Appointment ).filter_by(master_id=master.id).order_by(Appointment.date, Appointment.time).all()
+    session.close()
+    dates = sorted({a.date for a in avails} | {b.date for b in appts})
+    if not dates:
+        return await update.message.reply_text("Нет слотов или записей.", reply_markup=ADMIN_MENU)
+    lines = []
+    for d in dates:
+        slots = sorted(slot.time for slot in avails if slot.date == d)
+        taken = {b.time for b in appts if b.date == d and b.time is not None}
+        msg = ", ".join(f"{t.strftime('%H:%M')} {'🔴' if t in taken else '🟢'}" for t in slots) or "-"
+        lines.append(f"{d}:\n{msg}")
+    await update.message.reply_text("\n\n".join(lines), reply_markup=ADMIN_MENU)
+
+async def admin_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = SessionLocal()
+    master = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
+    appts  = session.query(Appointment ).filter_by(master_id=master.id).order_by(Appointment.date, Appointment.time).all()
+    session.close()
+    appts = [a for a in appts if a.time is not None]
+    if not appts:
+        return await update.message.reply_text("Никто ещё не записался.", reply_markup=ADMIN_MENU)
+    lines = [f"{a.date} в {a.time.strftime('%H:%M')} — {a.client_name}, {a.client_phone}" for a in appts]
+    await update.message.reply_text("\n".join(lines), reply_markup=ADMIN_MENU)
+
+# ——— МАСТЕР: УДАЛЕНИЕ ЗАПИСИ (FSM как в бронировании) ——————————————————
+# --- Календарь для удаления ---
+def build_delete_calendar(year: int, month: int, busy_dates: set[date]) -> InlineKeyboardMarkup:
+    prev_month = month - 1 or 12
+    prev_year  = year - 1 if month == 1 else year
+    next_month = month + 1 if month < 12 else 1
+    next_year  = year + 1 if month == 12 else year
+
+    header = [
+        InlineKeyboardButton("◀", callback_data=f"DEL_CAL|{prev_year}|{prev_month}"),
+        InlineKeyboardButton(f"{month}/{year}", callback_data="IGNORE"),
+        InlineKeyboardButton("▶", callback_data=f"DEL_CAL|{next_year}|{next_month}")
+    ]
+    week_days = ["Mo","Tu","We","Th","Fr","Sa","Su"]
+    rows = [[InlineKeyboardButton(w, callback_data="IGNORE") for w in week_days]]
+
+    first = date(year, month, 1)
+    shift = first.weekday()
+    row = [InlineKeyboardButton(" ", callback_data="IGNORE")] * shift
+
+    d = first
+    while d.month == month:
+        if d in busy_dates:
+            row.append(InlineKeyboardButton(str(d.day), callback_data=f"DEL_DAY|{d.isoformat()}"))
+        else:
+            row.append(InlineKeyboardButton(str(d.day), callback_data="IGNORE"))
+        if len(row) == 7:
+            rows.append(row)
+            row = []
+        d += timedelta(days=1)
+
+    if row:
+        row += [InlineKeyboardButton(" ", callback_data="IGNORE")] * (7 - len(row))
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("↩ Назад", callback_data="DEL_BACK")])
+    return InlineKeyboardMarkup([header] + rows)
+
+
+# --- Старт удаления ---
+async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    session = SessionLocal()
+    master = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
+    context.user_data["master_id"] = master.id
+    busy = {a.date for a in session.query(Appointment).filter_by(master_id=master.id).all()}
     session.close()
 
-    if not appt:
-        return await update.message.reply_text("Записи нет.")
-    await update.message.reply_text(
-        f"{appt.date} в {appt.time.strftime('%H:%M')} — {appt.client_name}, {appt.client_phone}"
-    )
+    if not busy:
+        return await update.message.reply_text("Нет записей для удаления.", reply_markup=ADMIN_MENU)
 
-async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    session = SessionLocal()
-    appt = session.query(Appointment)\
-                  .filter_by(user_id=update.effective_user.id)\
-                  .order_by(Appointment.created_at.desc())\
-                  .first()
-    session.close()
+    today = date.today()
+    cal = build_delete_calendar(today.year, today.month, busy)
+    await update.message.reply_text("Выберите дату для удаления:", reply_markup=cal)
+    return DEL_DATE
 
-    if not appt:
-        return await update.message.reply_text("Нечего отменять.")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Подтвердить отмену", callback_data="DO_CANCEL")],
-        [InlineKeyboardButton("↩ Назад", callback_data="BACK_TO_MAIN")]
-    ])
-    await update.message.reply_text(
-        f"Текущая запись: {appt.date} в {appt.time.strftime('%H:%M')}",
-        reply_markup=kb
-    )
 
-async def cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- Обработка кликов по календарю удаления ---
+async def delete_date_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data
 
-    session = SessionLocal()
-    appt = session.query(Appointment)\
-                  .filter_by(user_id=query.from_user.id)\
-                  .order_by(Appointment.created_at.desc())\
-                  .first()
+    # Листание месяцев
+    if data.startswith("DEL_CAL|"):
+        _, y, m = data.split("|")
+        y, m = int(y), int(m)
+        session = SessionLocal()
+        busy = {a.date for a in session.query(Appointment)
+                .filter_by(master_id=context.user_data["master_id"]).all()}
+        session.close()
+        cal = build_delete_calendar(y, m, busy)
+        await query.edit_message_reply_markup(reply_markup=cal)
+        return DEL_DATE
 
-    if appt:
+    # Назад
+    if data == "DEL_BACK":
+        await query.message.reply_text("Возвращаемся в меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # Выбор даты
+    if data.startswith("DEL_DAY|"):
+        _, iso = data.split("|")
+        chosen = date.fromisoformat(iso)
+
+        session = SessionLocal()
+        appts = session.query(Appointment).filter_by(
+            master_id=context.user_data["master_id"], date=chosen
+        ).order_by(Appointment.time).all()
+        session.close()
+
+        appts = [a for a in appts if a.time is not None]
+        if not appts:
+            await query.edit_message_text(f"Нет записей на {chosen}.", reply_markup=None)
+            return ConversationHandler.END
+
+        kb = [[InlineKeyboardButton(a.time.strftime("%H:%M"), callback_data=f"DEL_APPT|{a.id}")]
+              for a in appts]
+        kb.append([InlineKeyboardButton("↩ Назад", callback_data="DEL_BACK")])
+        await query.edit_message_text("Выберите время для удаления:", reply_markup=InlineKeyboardMarkup(kb))
+        return DEL_TIME
+
+
+# --- Удаление конкретной записи ---
+async def delete_time_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "DEL_BACK":
+        await query.message.reply_text("Возвращаемся в меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if data.startswith("DEL_APPT|"):
+        _, appt_id = data.split("|")
+        session = SessionLocal()
+        appt = session.get(Appointment, int(appt_id))
+        if not appt:
+            session.close()
+            await query.edit_message_text("Запись не найдена.", reply_markup=None)
+            return ConversationHandler.END
+
+        # Уведомляем клиента
+        if appt.user_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=appt.user_id,
+                    text=f"Ваша запись {appt.date} в {appt.time.strftime('%H:%M')} отменена мастером."
+                )
+            except Exception:
+                pass
+
         session.delete(appt)
         session.commit()
-        await query.edit_message_text("Запись отменена.", reply_markup=MAIN_MENU)
-    else:
-        await query.answer("Нет записи.")
-    session.close()
+        session.close()
 
-# —————————————————————————————————————————
-#  FSM мастера: добавление доступности
-# —————————————————————————————————————————
+        await query.edit_message_text("Запись удалена.", reply_markup=None)
+        context.user_data.clear()
+        return ConversationHandler.END
+
+# ——— МАСТЕР: ДОБАВЛЕНИЕ СЛОТОВ (FSM) ————————————————————————————
 async def master_avail_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = date.today()
     cal = build_calendar(today.year, today.month, busy=set())
-    await update.message.reply_text(
-        "Выберите дату для добавления слотов:", reply_markup=cal
-    )
+    await update.message.reply_text("Выберите дату для добавления слотов:", reply_markup=cal)
     return MASTER_DATE
 
 async def master_date_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    _, iso = query.data.split("|")
-    chosen = date.fromisoformat(iso)
-    context.user_data["avail_date"] = chosen
-
-    await query.edit_message_text(
-        f"Введите слоты для {chosen} (13.00,14.30):", reply_markup=None
-    )
-    return MASTER_ENTER_TIMES
+    data = query.data
+    if data.startswith("CAL|"):
+        _, y, m = data.split("|")
+        cal = build_calendar(int(y), int(m), busy=set())
+        await query.edit_message_reply_markup(reply_markup=cal)
+        return MASTER_DATE
+    if data == "BACK":
+        await query.message.reply_text("Меню мастера.", reply_markup=ADMIN_MENU)
+        await query.delete_message()
+        return ConversationHandler.END
+    if data.startswith("DAY|"):
+        _, iso = data.split("|")
+        chosen = date.fromisoformat(iso)
+        context.user_data["avail_date"] = chosen
+        await query.edit_message_text(f"Введите слоты для {chosen} (например, 13.00,14.30):")
+        return MASTER_ENTER_TIMES
 
 async def master_enter_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    slots = [t.replace(":", ".").strip() for t in update.message.text.split(",")]
-
+    slots = [t.strip().replace(":", ".") for t in update.message.text.split(",")]
     session = SessionLocal()
     me = session.query(Master).filter_by(tg_id=update.effective_user.id).first()
     for ts in slots:
         hh, mm = map(int, ts.split("."))
-        session.add(Availability(
-            master_id=me.id,
-            date=context.user_data["avail_date"],
-            time=time(hh, mm)
-        ))
+        session.add(Availability(master_id=me.id, date=context.user_data["avail_date"], time=time(hh, mm)))
     session.commit()
     session.close()
-
     y, m = context.user_data["avail_date"].year, context.user_data["avail_date"].month
     cal = build_calendar(y, m, busy=set())
-    await update.message.reply_text(
-        f"Слоты добавлены для {context.user_data['avail_date']}.", reply_markup=cal
-    )
+    await update.message.reply_text(f"Слоты добавлены для {context.user_data['avail_date']}.", reply_markup=cal)
     return MASTER_DATE
 
-async def master_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Возвращаемся в меню мастера.", reply_markup=ADMIN_MENU)
-    context.user_data.clear()
-    return ConversationHandler.END
-
-# —————————————————————————————————————————
-#  Регистрация хендлеров и запуск
-# —————————————————————————————————————————
+# ——— РЕГИСТРАЦИЯ ——————————————————————————————————
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Общие команды
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("addmaster", add_master))
-    app.add_handler(CommandHandler("mybooking", my_booking))
-    app.add_handler(CommandHandler("cancelbooking", cancel_booking))
 
-    # Просмотр слотов мастера
-    app.add_handler(MessageHandler(filters.Regex("📅 Мои слоты"), view_availability))
+    # Клиентские кнопки (всегда активны)
+    app.add_handler(MessageHandler(filters.Regex("^📝 Запись$"), book_start))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Моя запись$"), my_booking))
+    app.add_handler(MessageHandler(filters.Regex("^❌ Отменить запись$"), cancel_start))
+    app.add_handler(CallbackQueryHandler(cancel_yes_cb, pattern="^CANCEL_YES$"))
+    app.add_handler(MessageHandler(filters.Regex("^☎ Контакты$"), send_contacts))
 
-    # FSM: бронирование клиента
-    booking_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("📝 Запись"), book_start)],
+    # Мастерские кнопки (всегда активны)
+    app.add_handler(MessageHandler(filters.Regex("^📅 Мои слоты$"), view_availability))
+    app.add_handler(MessageHandler(filters.Regex("^📄 Все записи$"), admin_all))
+
+    # FSM удаления записи (календарь как в бронировании: CAL| и DAY|)
+    delete_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🗑 Удалить запись$"), delete_start)],
         states={
-            SELECT_MASTER: [CallbackQueryHandler(sel_master_cb, pattern="^SEL_MASTER")],
-            SELECT_DATE:   [CallbackQueryHandler(calendar_cb, pattern="^(CAL|DAY|BACK_TO_MAIN)")],
-            SELECT_TIME:   [CallbackQueryHandler(select_time_cb, pattern="^TIME\\|")],
-            ENTER_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name)],
-            ENTER_PHONE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone)],
+            DEL_DATE: [
+                CallbackQueryHandler(delete_date_cb, pattern=r"^DEL_CAL\|"),
+                CallbackQueryHandler(delete_date_cb, pattern=r"^DEL_DAY\|"),
+                CallbackQueryHandler(delete_date_cb, pattern=r"^DEL_BACK$"),
+                CallbackQueryHandler(ignore_cb, pattern=r"^IGNORE$")
+            ],
+            DEL_TIME: [
+                CallbackQueryHandler(delete_time_cb, pattern=r"^DEL_APPT\|"),
+                CallbackQueryHandler(delete_time_cb, pattern=r"^DEL_BACK$")
+            ]
         },
-        fallbacks=[
-            CallbackQueryHandler(cancel_cb, pattern="^DO_CANCEL"),
-            MessageHandler(filters.Regex("^↩ Назад$"), lambda u, c: u.message.reply_text("Отмена.", reply_markup=MAIN_MENU))
-        ]
+        fallbacks=[MessageHandler(filters.Regex("^↩ Назад$"), start)],
+        per_user=True
+    )
+    app.add_handler(delete_conv)
+
+    # FSM бронирования
+    booking_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📝 Запись$"), book_start)],
+        states={
+            SELECT_MASTER: [
+                CallbackQueryHandler(sel_master_cb, pattern=r"^SEL_MASTER\|"),
+                CallbackQueryHandler(ignore_cb,     pattern=r"^IGNORE$")
+            ],
+            SELECT_DATE: [
+                CallbackQueryHandler(calendar_cb, pattern=r"^CAL\|"),
+                CallbackQueryHandler(calendar_cb, pattern=r"^DAY\|"),
+                CallbackQueryHandler(calendar_cb, pattern=r"^BACK$"),
+                CallbackQueryHandler(ignore_cb,   pattern=r"^IGNORE$")
+            ],
+            SELECT_TIME: [
+                CallbackQueryHandler(select_time_cb, pattern=r"^TIME\|"),
+                CallbackQueryHandler(ignore_cb,      pattern=r"^IGNORE$")
+            ],
+            ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, enter_name_cb)],
+            ENTER_PHONE:[MessageHandler(filters.TEXT & ~filters.COMMAND, enter_phone_cb)]
+        },
+        fallbacks=[MessageHandler(filters.Regex("^↩ Назад$"), start)],
+        per_user=True
     )
     app.add_handler(booking_conv)
 
-    # FSM: доступность мастера
-    master_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("🗓 Указать дату и время"), master_avail_start)],
+    # FSM добавления слотов мастером (тот же календарь)
+    avail_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🗓 Указать дату и время$"), master_avail_start)],
         states={
-            MASTER_DATE:        [CallbackQueryHandler(master_date_chosen, pattern="^DAY\\|")],
-            MASTER_ENTER_TIMES: [MessageHandler(filters.Regex(r"^\d\d[.:]\d\d(,\s*\d\d[.:]\d\d)*$"), master_enter_times)],
+            MASTER_DATE: [
+                CallbackQueryHandler(master_date_chosen, pattern=r"^CAL\|"),
+                CallbackQueryHandler(master_date_chosen, pattern=r"^DAY\|"),
+                CallbackQueryHandler(master_date_chosen, pattern=r"^BACK$"),
+                CallbackQueryHandler(ignore_cb,          pattern=r"^IGNORE$")
+            ],
+            MASTER_ENTER_TIMES: [
+                MessageHandler(filters.Regex(r"^\d{1,2}[.:]\d{2}(,\s*\d{1,2}[.:]\d{2})*$"), master_enter_times)
+            ]
         },
-        fallbacks=[MessageHandler(filters.Regex("^↩ Назад$"), master_cancel)]
+        fallbacks=[MessageHandler(filters.Regex("^↩ Назад$"), start)],
+        per_user=True
     )
-    app.add_handler(master_conv)
+    app.add_handler(avail_conv)
 
-    # Обработчик отмены записи
-    app.add_handler(CallbackQueryHandler(cancel_cb, pattern="^DO_CANCEL"))
+    # IGNORE глобально
+    app.add_handler(CallbackQueryHandler(ignore_cb, pattern=r"^IGNORE$"))
 
     app.run_polling()
 
